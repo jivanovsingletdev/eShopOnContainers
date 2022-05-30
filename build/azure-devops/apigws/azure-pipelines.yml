@@ -86,7 +86,46 @@ stages:
 - stage: cd_stg
   dependsOn: ci
   displayName: CD - STG
-  
+    jobs:
+  - deployment: website_deployment
+    displayName: Website Deployment
+    pool:
+      vmImage: 'ubuntu-20.04'
+    environment: Production
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Add storage-preview extension to Azure CLI'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az extension add --name storage-preview'
+          - task: AzureCLI@2
+            displayName: 'Delete website files from Azure storage'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az storage blob delete-batch --account-name ascosurveyweb --source "`$web"'
+            continueOnError: true
+          - task: AzureCLI@2
+            displayName: 'Upload website files to Azure storage'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az storage blob upload-batch --account-name ascosurveyweb --destination "`$web"  --source $(Pipeline.Workspace)/AscoSurveyWeb'
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy Function with service connection'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              appType: 'functionAppLinux'
+              appName: 'ascosurveyapi'
+              package: '$(Pipeline.Workspace)/api-artifact'
+              runtimeStack: 'DOTNET|3.1'
 #create template from all steps CD-PRD 
   
 - stage: cd_prd
