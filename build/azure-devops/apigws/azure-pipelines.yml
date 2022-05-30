@@ -1,32 +1,134 @@
 trigger:
-  branches:
+  branches: 
     include:
-    - master
-    - dev
-  paths:
-    include:
-    - src/ApiGateways/*
-    - build/azure-devops/buildimages.yml
-    - build/azure-devops/multiarch.yml
-    - build/azure-devops/apigws/*
-    - deploy/k8s/helm/apigwmm/*
-    - deploy/k8s/helm/apigwms/*
-    - deploy/k8s/helm/apigwwm/*
-    - deploy/k8s/helm/apigwws/*
-    exclude:
-    - src/ApiGateways/Mobile.Bff.Shopping/aggregator/*
-    - src/ApiGateways/Web.Bff.Shopping/aggregator/*
-jobs:
-- job: PublishCharts
-  condition: ne('$(Build.Reason)', 'PullRequest')
-  pool:
-    vmImage: 'ubuntu-16.04'
-  steps:
-  - task: CopyFiles@2
-    inputs:
-      sourceFolder: $(Build.SourcesDirectory)/deploy/k8s/helm
-      targetFolder: $(Build.ArtifactStagingDirectory)/deploy/k8s/helm
-  - task: PublishBuildArtifacts@1
-    inputs:
-      pathtoPublish: $(Build.ArtifactStagingDirectory)/deploy/k8s/helm
-      artifactName: helm
+      - main
+stages:
+- stage: ci
+  displayName: 'Continuous Integration'
+  jobs:
+    - job: build_and_publish_website
+      displayName: 'Build and publish website'
+      pool:
+        vmImage: 'ubuntu-20.04'
+      steps: 
+        - task: NodeTool@0
+          displayName: 'Install Node.js'
+          inputs:
+            versionSpec: '12.x'
+        - task: Npm@1
+          displayName: 'NPM Install'
+          inputs:
+            command: 'install'
+            workingDir: 'src/AscoSurvey/Client/web/'
+        - task: Npm@1
+          displayName: 'NPM Lint'
+          inputs:
+            command: 'custom'
+            workingDir: 'src/AscoSurvey/Client/web/'
+            customCommand: 'run lint'
+        - task: Npm@1
+          displayName: 'NPM Build'
+          inputs:
+            command: 'custom'
+            workingDir: 'src/AscoSurvey/Client/web/'
+            customCommand: 'run build'
+        - task: PublishPipelineArtifact@1
+          displayName: 'Publish Web Artifact'
+          inputs:
+            targetPath: '$(System.DefaultWorkingDirectory)/src/AscoSurvey/Client/web/dist'
+            artifact: 'AscoSurveyWeb'
+            publishLocation: 'pipeline'
+    - job: build_and_publish_function
+      displayName: 'Build and publish function'
+      pool:
+        vmImage: 'windows-2022'
+      steps:
+        - task: DotNetCoreCLI@2
+          displayName: 'Restore dependecies'
+          inputs:
+            command: 'restore'
+            projects: '$(System.DefaultWorkingDirectory)/src/AscoSurvey.sln'
+            feedsToUse: 'select'
+        - task: DotNetCoreCLI@2
+          displayName: 'Build function'
+          inputs:
+            command: 'build'
+            projects: '$(System.DefaultWorkingDirectory)/src/AscoSurvey.sln'
+            arguments: '-c release --no-restore'
+        - task: NodeTool@0 
+          inputs:
+            versionSpec: 13.x
+        - script : npm install -g azurite
+          displayName: Install Azurite
+        - script : start /B azurite
+          displayName: Start azurite
+        - task: DotNetCoreCLI@2
+          displayName: 'Run UnitTests'
+          inputs:
+            command: 'test'
+            projects: '$(System.DefaultWorkingDirectory)/src/AscoSurvey.sln'
+            arguments: '-c release --no-restore --collect "Code coverage"'
+        - task: DotNetCoreCLI@2
+          displayName: 'Create deployment artifact'
+          inputs:
+            command: 'publish'
+            publishWebProjects: false
+            projects: '$(System.DefaultWorkingDirectory)/src/AscoSurvey.sln'
+            arguments: '--configuration Release --output $(Build.ArtifactStagingDirectory)/api-output'
+            zipAfterPublish: false
+            modifyOutputPath: false
+        - publish: $(Build.ArtifactStagingDirectory)/api-output
+          displayName: 'Publish API Artifact'
+          artifact: api-artifact
+
+#new stage that deploys to staging enviroment
+#the new stage should be the same as the cd stage but with different values
+- stage: cd_stg
+  dependsOn: ci
+  displayName: CD - STG
+  
+#create template from all steps CD-PRD 
+  
+- stage: cd_prd
+  dependsOn: cd_stg
+  displayName: CD - PRD
+  jobs:
+  - deployment: website_deployment
+    displayName: Website Deployment
+    pool:
+      vmImage: 'ubuntu-20.04'
+    environment: Production
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: 'Add storage-preview extension to Azure CLI'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az extension add --name storage-preview'
+          - task: AzureCLI@2
+            displayName: 'Delete website files from Azure storage'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az storage blob delete-batch --account-name ascosurveyweb --source "`$web"'
+            continueOnError: true
+          - task: AzureCLI@2
+            displayName: 'Upload website files to Azure storage'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az storage blob upload-batch --account-name ascosurveyweb --destination "`$web"  --source $(Pipeline.Workspace)/AscoSurveyWeb'
+          - task: AzureFunctionApp@1
+            displayName: 'Deploy Function with service connection'
+            inputs:
+              azureSubscription: 'ScienceBite-CA'
+              appType: 'functionAppLinux'
+              appName: 'ascosurveyapi'
+              package: '$(Pipeline.Workspace)/api-artifact'
+              runtimeStack: 'DOTNET|3.1'
